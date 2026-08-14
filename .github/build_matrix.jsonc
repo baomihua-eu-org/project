@@ -1,0 +1,51 @@
+{
+  // BaoMiHua Build Matrix Configuration
+  // Controls which platforms are built for each mode and product.
+  //
+  // mode: "minimal" = fast dev/test builds, "full" = all configured platforms
+  // build_method: "cargo-dist" | "cross" | "tauri"
+  // CLI 无外部依赖，只需各架构可执行文件 zip；GUI Linux 用 AppImage 打包为 zip。
+
+  "cli": {
+    "cargo-dist": [
+      { "runner": "ubuntu-latest",  "target": "x86_64-unknown-linux-gnu",      "mode": ["full"] },
+      { "runner": "ubuntu-latest",  "target": "x86_64-unknown-linux-musl",     "mode": ["minimal", "full"] },
+      { "runner": "ubuntu-latest",  "target": "aarch64-unknown-linux-gnu",     "mode": ["full"] },
+      { "runner": "windows-latest", "target": "x86_64-pc-windows-msvc",        "mode": ["full"] },
+      { "runner": "macos-15",       "target": "x86_64-apple-darwin",           "mode": ["full"] },
+      { "runner": "macos-15",       "target": "aarch64-apple-darwin",          "mode": ["full"] }
+    ],
+    "cross": [
+      // 注意：i686-gnu / i686-musl / riscv64gc-gnu / powerpc64le-gnu 因
+      // rquickjs-sys（QuickJS C 编译）在 cross 容器内工具链兼容问题暂不可用：
+      // gnu 目标缺目标架构 libc/gcc 头文件（stdbool.h），i686-musl 的
+      // x87 FPU 宏需要 GNU C 扩展。待交叉工具链修复后再加回。
+      { "target": "aarch64-unknown-linux-musl",      "mode": ["full"] },
+      { "target": "armv7-unknown-linux-musleabihf",  "mode": ["full"] }
+    ],
+    "android": [
+      { "target": "aarch64-linux-android",   "ndk_abi": "arm64-v8a",    "mode": ["full"] },
+      { "target": "armv7-linux-androideabi", "ndk_abi": "armeabi-v7a",  "mode": ["full"] },
+      { "target": "x86_64-linux-android",    "ndk_abi": "x86_64",       "mode": ["full"] }
+    ]
+  },
+
+  // GUI targets (Tauri)
+  "gui": {
+    "tauri": [
+      { "runner": "windows-latest",   "target": "x86_64-pc-windows-msvc",      "bundles": "",          "artifact_ext": ".exe",      "mode": ["full"] },
+      { "runner": "ubuntu-latest",    "target": "x86_64-unknown-linux-gnu",    "bundles": "appimage",    "artifact_ext": ".AppImage",  "mode": ["minimal", "full"] },
+      { "runner": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-gnu",   "bundles": "appimage",    "artifact_ext": ".AppImage",  "mode": ["full"] },
+      { "runner": "macos-15",         "target": "x86_64-apple-darwin",         "bundles": "dmg",       "artifact_ext": ".dmg",      "mode": ["full"] },
+      { "runner": "macos-15",         "target": "aarch64-apple-darwin",        "bundles": "dmg",       "artifact_ext": ".dmg",      "mode": ["full"] }
+    ],
+    "android": [
+      { "runner": "ubuntu-latest", "target": "aarch64-linux-android",   "mode": ["full"] },
+      { "runner": "ubuntu-latest", "target": "armv7-linux-androideabi", "mode": ["full"] },
+      { "runner": "ubuntu-latest", "target": "x86_64-linux-android",    "mode": ["full"] }
+    ],
+    "ios": [
+      { "runner": "macos-15", "target": "aarch64-apple-ios", "mode": ["full"] }
+    ]
+  }
+}

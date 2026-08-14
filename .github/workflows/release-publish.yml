@@ -1,0 +1,1371 @@
+name: Publish Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      workspace_ref:
+        description: "Source ref in the private source repository (tag/branch/sha). Default: main"
+        required: false
+        default: "main"
+      release_name:
+        description: "Release name override. Leave empty to use trigger-mode default naming."
+        required: false
+      build_mode:
+        description: "Build mode: full (all configured platforms) or minimal (CLI musl + GUI x64 Linux zip)"
+        type: choice
+        options:
+          - full
+          - minimal
+        required: false
+        default: "full"
+      build_target:
+        description: "Build target set: cli / gui / cli+gui"
+        type: choice
+        options:
+          - cli+gui
+          - cli
+          - gui
+        required: false
+        default: "cli+gui"
+      prerelease:
+        description: "Mark as pre-release"
+        type: boolean
+        required: false
+        default: true
+      trigger_mode:
+        description: "Release trigger mode controlling default release naming"
+        type: choice
+        options:
+          - manual
+          - tag
+        required: false
+        default: "manual"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.workspace_ref }}-${{ github.event.inputs.build_mode }}-${{ github.event.inputs.build_target }}-${{ github.event.inputs.trigger_mode }}
+  cancel-in-progress: true
+
+jobs:
+  resolve-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      workspace_ref: ${{ steps.meta.outputs.workspace_ref }}
+      workspace_sha: ${{ steps.meta.outputs.workspace_sha }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      release_timestamp: ${{ steps.meta.outputs.release_timestamp }}
+      pkg_version: ${{ steps.meta.outputs.pkg_version }}
+      publish_version: ${{ steps.meta.outputs.publish_version }}
+      build_mode: ${{ steps.matrix.outputs.build_mode }}
+      cli_cargo_dist: ${{ steps.matrix.outputs.cli_cargo_dist }}
+      cli_cross: ${{ steps.matrix.outputs.cli_cross }}
+      cli_android: ${{ steps.matrix.outputs.cli_android }}
+      gui_tauri: ${{ steps.matrix.outputs.gui_tauri }}
+      gui_android: ${{ steps.matrix.outputs.gui_android }}
+      gui_ios: ${{ steps.matrix.outputs.gui_ios }}
+      has_cli: ${{ steps.matrix.outputs.has_cli }}
+      has_gui: ${{ steps.matrix.outputs.has_gui }}
+      has_cargo_dist: ${{ steps.matrix.outputs.has_cargo_dist }}
+      has_cross: ${{ steps.matrix.outputs.has_cross }}
+      has_android: ${{ steps.matrix.outputs.has_android }}
+      has_gui_tauri: ${{ steps.matrix.outputs.has_gui_tauri }}
+      has_gui_android: ${{ steps.matrix.outputs.has_gui_android }}
+      has_gui_ios: ${{ steps.matrix.outputs.has_gui_ios }}
+    steps:
+      - name: Verify source repository URL configured
+        env:
+          SRC_URL: ${{ secrets.SRC_URL || vars.SRC_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SRC_URL:-}" ]; then
+            echo "::error::missing SRC_URL (set as repository secret or variable with the private source repo URL)"
+            exit 1
+          fi
+          echo "::notice::SRC_URL configured"
+
+      - name: Resolve workspace ref
+        id: resolve-ref
+        run: |
+          ref="${{ github.event.inputs.workspace_ref }}"
+          echo "ref=${ref:-main}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout workspace source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SRC_URL || vars.SRC_URL }}
+          ref: ${{ steps.resolve-ref.outputs.ref }}
+          token: ${{ secrets.GHTOKEN }}
+          path: workspace
+          submodules: true
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Checkout project repo
+        uses: actions/checkout@v4
+        with:
+          path: project
+
+      - name: Resolve release metadata
+        id: meta
+        working-directory: workspace
+        run: |
+          set -euo pipefail
+          ref="${{ steps.resolve-ref.outputs.ref }}"
+          trigger_mode="${{ github.event.inputs.trigger_mode }}"
+          release_name_input="${{ github.event.inputs.release_name }}"
+          prerelease_input="${{ github.event.inputs.prerelease }}"
+          default_tag_timestamp="$(TZ=Asia/Shanghai date '+%Y%m%d%H%M%S')"
+          workspace_sha="$(git rev-parse HEAD)"
+          echo "workspace_ref=${ref}" >> "$GITHUB_OUTPUT"
+          echo "workspace_sha=${workspace_sha}" >> "$GITHUB_OUTPUT"
+
+          pkg_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "baomihua-server") | .version')"
+          release_timestamp=""
+          publish_version="${pkg_version}"
+          if [ "${prerelease_input}" = "true" ] || [[ "${pkg_version}" == *-* ]]; then
+            release_timestamp="$(TZ=Asia/Shanghai date '+%Y%m%d%H%M%S')"
+            publish_version="${pkg_version}.${release_timestamp}"
+          fi
+
+          echo "pkg_version=${pkg_version}" >> "$GITHUB_OUTPUT"
+          echo "release_timestamp=${release_timestamp}" >> "$GITHUB_OUTPUT"
+          echo "publish_version=${publish_version}" >> "$GITHUB_OUTPUT"
+
+          if [ -n "${release_name_input}" ]; then
+            release_tag="${release_name_input}"
+          else
+            case "${trigger_mode:-manual}" in
+              tag)
+                case "${ref}" in
+                  BaoMiHua-v*) release_tag="${ref}" ;;
+                  v*) release_tag="BaoMiHua-${ref}" ;;
+                  BaoMiHua-*) release_tag="${ref}" ;;
+                  *) release_tag="BaoMiHua-${ref}" ;;
+                esac
+                ;;
+              manual|*)
+                release_tag="manually_${release_timestamp:-$default_tag_timestamp}"
+                ;;
+            esac
+          fi
+
+          if [ -n "${release_timestamp}" ] \
+            && [ "${trigger_mode:-manual}" != "tag" ] \
+            && [[ "${release_tag}" != *"_${release_timestamp}" ]]; then
+            release_tag="${release_tag}_${release_timestamp}"
+          fi
+
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+          echo "::notice::pkg_version=${pkg_version}  publish_version=${publish_version}  release_tag=${release_tag}  ref=${ref}  workspace_sha=${workspace_sha}  trigger_mode=${trigger_mode:-manual}"
+
+      - name: Resolve build matrix
+        id: matrix
+        working-directory: project
+        run: |
+          mode="${{ github.event.inputs.build_mode }}"
+          mode="${mode:-full}"
+          target_set="${{ github.event.inputs.build_target }}"
+          target_set="${target_set:-cli+gui}"
+
+          sed 's|//.*||' .github/build_matrix.jsonc | jq -c '.' > /tmp/matrix.json
+
+          cli_cargo_dist="$(jq -c --arg m "$mode" '[.cli["cargo-dist"][] | select(.mode | index($m))]' /tmp/matrix.json)"
+          cli_cross="$(jq -c --arg m "$mode" '[.cli.cross[] | select(.mode | index($m))]' /tmp/matrix.json)"
+          cli_android="$(jq -c --arg m "$mode" '[.cli.android[] | select(.mode | index($m))]' /tmp/matrix.json)"
+          gui_tauri="$(jq -c --arg m "$mode" '[.gui.tauri[] | select(.mode | index($m))]' /tmp/matrix.json)"
+          gui_android="$(jq -c --arg m "$mode" '[(.gui.android // [])[] | select(.mode | index($m))]' /tmp/matrix.json)"
+          gui_ios="$(jq -c --arg m "$mode" '[(.gui.ios // [])[] | select(.mode | index($m))]' /tmp/matrix.json)"
+
+          if [ "$target_set" = "cli" ]; then
+            gui_tauri='[]'
+            gui_android='[]'
+            gui_ios='[]'
+          elif [ "$target_set" = "gui" ]; then
+            cli_cargo_dist='[]'
+            cli_cross='[]'
+            cli_android='[]'
+          fi
+
+          has_cli=false
+          if [ "$target_set" = "cli" ] || [ "$target_set" = "cli+gui" ]; then
+            has_cli=true
+          fi
+
+          has_gui=false
+          if [ "$target_set" = "gui" ] || [ "$target_set" = "cli+gui" ]; then
+            has_gui=true
+          fi
+
+          echo "cli_cargo_dist=${cli_cargo_dist}" >> "$GITHUB_OUTPUT"
+          echo "cli_cross=${cli_cross}" >> "$GITHUB_OUTPUT"
+          echo "cli_android=${cli_android}" >> "$GITHUB_OUTPUT"
+          echo "gui_tauri=${gui_tauri}" >> "$GITHUB_OUTPUT"
+          echo "gui_android=${gui_android}" >> "$GITHUB_OUTPUT"
+          echo "gui_ios=${gui_ios}" >> "$GITHUB_OUTPUT"
+          echo "build_mode=${mode}" >> "$GITHUB_OUTPUT"
+          echo "has_cli=${has_cli}" >> "$GITHUB_OUTPUT"
+          echo "has_gui=${has_gui}" >> "$GITHUB_OUTPUT"
+
+          echo "has_cargo_dist=$([ "$(echo "$cli_cargo_dist" | jq 'length')" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "has_cross=$([ "$(echo "$cli_cross" | jq 'length')" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "has_android=$([ "$(echo "$cli_android" | jq 'length')" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "has_gui_tauri=$([ "$(echo "$gui_tauri" | jq 'length')" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "has_gui_android=$([ "$(echo "$gui_android" | jq 'length')" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "has_gui_ios=$([ "$(echo "$gui_ios" | jq 'length')" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+          echo "::notice::mode=${mode} target=${target_set} cli_cargo_dist=$(echo "$cli_cargo_dist" | jq 'length') cli_cross=$(echo "$cli_cross" | jq 'length') cli_android=$(echo "$cli_android" | jq 'length') gui_tauri=$(echo "$gui_tauri" | jq 'length') gui_android=$(echo "$gui_android" | jq 'length') gui_ios=$(echo "$gui_ios" | jq 'length')"
+
+  build-frontend:
+    needs: resolve-matrix
+    if: needs.resolve-matrix.outputs.has_cli == 'true' || needs.resolve-matrix.outputs.has_gui == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout workspace
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SRC_URL || vars.SRC_URL }}
+          ref: ${{ needs.resolve-matrix.outputs.workspace_ref }}
+          token: ${{ secrets.GHTOKEN }}
+          path: workspace
+          submodules: true
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Cache Bun
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.bun/install/cache
+            workspace/frontend/node_modules
+          key: bun-${{ hashFiles('workspace/frontend/bun.lock') }}
+          restore-keys: bun-
+
+      - name: Build frontend
+        working-directory: workspace/frontend
+        run: |
+          bun install
+          bun run build
+          test -f dist/index.html
+
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: workspace/frontend/dist
+
+  # ============================================================
+  # CLI native builds
+  # ============================================================
+  build-cli:
+    needs: [resolve-matrix, build-frontend]
+    if: needs.resolve-matrix.outputs.has_cargo_dist == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve-matrix.outputs.cli_cargo_dist) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout project repo
+        uses: actions/checkout@v4
+
+      - name: Checkout workspace
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SRC_URL || vars.SRC_URL }}
+          ref: ${{ needs.resolve-matrix.outputs.workspace_ref }}
+          token: ${{ secrets.GHTOKEN }}
+          path: workspace
+          submodules: true
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: workspace/frontend/dist
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential pkg-config clang cmake ninja-build
+
+      - name: Install musl-tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools
+
+      - name: Install cross-compilation toolchain (aarch64 gnu)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: workspace
+          key: cli-${{ matrix.target }}
+
+      - name: Build CLI binary
+        working-directory: workspace
+        shell: bash
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+            AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar \
+            cargo build --release --package baomihua-server --target "${{ matrix.target }}"
+          else
+            cargo build --release --package baomihua-server --target "${{ matrix.target }}"
+          fi
+
+      - name: Package plain binary artifacts
+        shell: bash
+        run: |
+          zip_one() {
+            out="$1"
+            input="$2"
+            if command -v zip >/dev/null 2>&1; then
+              zip -j "${out}" "${input}"
+              return
+            fi
+            python3 -c "import os,sys,zipfile; o,i=sys.argv[1],sys.argv[2]; z=zipfile.ZipFile(o,'w',zipfile.ZIP_DEFLATED); z.write(i, arcname=os.path.basename(i)); z.close()" "${out}" "${input}"
+          }
+
+          target="${{ matrix.target }}"
+          if [[ "${target}" == *windows* ]]; then
+            bin="workspace/target/${target}/release/baomihua-server.exe"
+            if [ ! -f "${bin}" ]; then
+              bin="$(find workspace/target -type f -name 'baomihua-server.exe' | grep "${target}" | head -1 || true)"
+            fi
+          else
+            bin="workspace/target/${target}/release/baomihua-server"
+            if [ ! -f "${bin}" ]; then
+              bin="$(find workspace/target -type f -name 'baomihua-server' | grep "${target}" | head -1 || true)"
+            fi
+          fi
+          if [ ! -f "${bin}" ]; then
+            echo "::error::No binary found for ${target}"
+            find workspace/target -maxdepth 6 -type f | sed -n '1,200p'
+            exit 1
+          fi
+
+          source "${{ github.workspace }}/.github/scripts/arch-helpers.sh"
+          base="$(baomihua_cli_base "${target}" default)"
+
+          mkdir -p dist
+          if [[ "${target}" == *windows* ]]; then
+            zip_one "dist/${base}.exe.zip" "${bin}"
+          else
+            zip -j "dist/${base}.zip" "${bin}"
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist/*
+
+  # ============================================================
+  # CLI cross-compiled builds (Linux exotic)
+  # ============================================================
+  build-cli-cross:
+    needs: [resolve-matrix, build-frontend]
+    if: needs.resolve-matrix.outputs.has_cross == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve-matrix.outputs.cli_cross) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout project repo
+        uses: actions/checkout@v4
+
+      - name: Checkout workspace
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SRC_URL || vars.SRC_URL }}
+          ref: ${{ needs.resolve-matrix.outputs.workspace_ref }}
+          token: ${{ secrets.GHTOKEN }}
+          path: workspace
+          submodules: true
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: workspace/frontend/dist
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install system dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential pkg-config clang
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: workspace
+          key: cross-${{ matrix.target }}
+
+      - name: Build via cross
+        working-directory: workspace
+        run: cross build --release --package baomihua-server --target "${{ matrix.target }}"
+
+      - name: Package binary
+        run: |
+          target="${{ matrix.target }}"
+          source "${{ github.workspace }}/.github/scripts/arch-helpers.sh"
+          base="$(baomihua_cli_base "${target}" default)"
+
+          bin="workspace/target/${target}/release/baomihua-server"
+          if [ ! -f "${bin}" ]; then
+            bin="workspace/target/${target}/release/baomihua-server.exe"
+          fi
+          mkdir -p dist
+          zip -j "dist/${base}.zip" "${bin}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist/*
+
+  # ============================================================
+  # CLI Android builds (cargo-ndk)
+  # ============================================================
+  build-cli-android:
+    needs: [resolve-matrix, build-frontend]
+    if: needs.resolve-matrix.outputs.has_android == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve-matrix.outputs.cli_android) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout project repo
+        uses: actions/checkout@v4
+
+      - name: Checkout workspace
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SRC_URL || vars.SRC_URL }}
+          ref: ${{ needs.resolve-matrix.outputs.workspace_ref }}
+          token: ${{ secrets.GHTOKEN }}
+          path: workspace
+          submodules: true
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: workspace/frontend/dist
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install system dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential pkg-config clang
+
+      - name: Setup Android SDK/NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: workspace
+          key: cli-android-${{ matrix.target }}
+
+      - name: Build Android binary
+        working-directory: workspace
+        env:
+          # API 24+：local_ip_address 依赖的 getifaddrs 从 Android API 24 开始可用
+          CARGO_NDK_PLATFORM: "24"
+        run: cargo ndk -t ${{ matrix.ndk_abi }} build --release --package baomihua-server
+
+      - name: Package binary
+        run: |
+          target="${{ matrix.target }}"
+          source "${{ github.workspace }}/.github/scripts/arch-helpers.sh"
+          base="$(baomihua_cli_base "${target}" android)"
+
+          bin="$(find workspace/target -path "*/release/baomihua-server" | grep "${target}" | head -1 || true)"
+          if [ -z "${bin}" ]; then
+            echo "::error::Android binary not found for ${target}"
+            find workspace/target -maxdepth 5 -type f | sed -n '1,200p'
+            exit 1
+          fi
+          mkdir -p dist
+          zip -j "dist/${base}.zip" "${bin}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist/*
+
+  # ============================================================
+  # GUI desktop builds via Tauri
+  # ============================================================
+  build-gui:
+    needs: [resolve-matrix, build-frontend]
+    if: needs.resolve-matrix.outputs.has_gui_tauri == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve-matrix.outputs.gui_tauri) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout project repo
+        uses: actions/checkout@v4
+
+      - name: Checkout workspace
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SRC_URL || vars.SRC_URL }}
+          ref: ${{ needs.resolve-matrix.outputs.workspace_ref }}
+          token: ${{ secrets.GHTOKEN }}
+          path: workspace
+          submodules: true
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: workspace/frontend/dist
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: workspace
+          key: gui-desktop-${{ matrix.target }}
+
+      - name: Install Linux dependencies for Tauri
+        if: startsWith(matrix.runner, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            cmake \
+            ninja-build \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            xdg-utils \
+            patchelf
+
+      - name: Install cargo-tauri CLI
+        uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli@2
+
+      - name: Sync GUI version and build
+        working-directory: workspace/src-tauri
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path('tauri.conf.json')
+          cfg = json.loads(p.read_text())
+          cfg['version'] = "${{ needs.resolve-matrix.outputs.pkg_version }}"
+          cfg.setdefault('bundle', {})['active'] = True
+          # CI 中 frontend dist 由 build-frontend job 构建并下载到 workspace/frontend/dist；
+          # 置空 beforeBuildCommand，避免 tauri 在错误工作目录（frontend 目录）重复构建前端
+          cfg.setdefault('build', {})['beforeBuildCommand'] = ''
+          Path('tauri.ci.conf.json').write_text(json.dumps(cfg, indent=2))
+          PY
+          bundles="${{ matrix.bundles }}"
+          if [ -n "${bundles}" ]; then
+            cargo tauri build --target "${{ matrix.target }}" --bundles "${bundles}" --config tauri.ci.conf.json
+          else
+            cargo tauri build --target "${{ matrix.target }}" --config tauri.ci.conf.json
+          fi
+
+      - name: Package GUI artifact
+        shell: bash
+        run: |
+          zip_one() {
+            out="$1"
+            input="$2"
+            if command -v zip >/dev/null 2>&1; then
+              zip -j "${out}" "${input}"
+              return
+            fi
+            python3 -c "import os,sys,zipfile; o,i=sys.argv[1],sys.argv[2]; z=zipfile.ZipFile(o,'w',zipfile.ZIP_DEFLATED); z.write(i, arcname=os.path.basename(i)); z.close()" "${out}" "${input}"
+          }
+
+          mkdir -p dist
+          target="${{ matrix.target }}"
+          source "${{ github.workspace }}/.github/scripts/arch-helpers.sh"
+          base="$(baomihua_gui_base "${target}" default)"
+
+          if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
+            portable_exe="workspace/target/${{ matrix.target }}/release/baomihua-eu-org.exe"
+            if [ ! -f "${portable_exe}" ]; then
+              portable_exe="$(find workspace/target/${{ matrix.target }}/release -maxdepth 1 -type f -name '*.exe' 2>/dev/null | head -1 || true)"
+            fi
+            if [ -z "${portable_exe}" ] || [ ! -f "${portable_exe}" ]; then
+              echo "::error::No Windows GUI executable found for target ${target}"
+              exit 1
+            fi
+            zip_one "dist/${base}.exe.zip" "${portable_exe}"
+          elif [[ "${target}" == *unknown-linux* ]]; then
+            # Linux GUI：tauri appimage bundle 产物（*.AppImage）打包为 zip，
+            # 文件名保持 bmh-linux-<arch>-<libc>-gui-App.zip（catalog 按 .zip 匹配）
+            app="$(find workspace/target/${target}/release/bundle/appimage -type f -name '*.AppImage' 2>/dev/null | head -1 || true)"
+            if [ -z "${app}" ] || [ ! -f "${app}" ]; then
+              echo "::error::No Linux GUI AppImage found for target ${target}"
+              exit 1
+            fi
+            zip -j "dist/${base}.zip" "${app}"
+          else
+            ext="${{ matrix.artifact_ext }}"
+            file="$(find workspace/target/${{ matrix.target }}/release/bundle -type f -name "*${ext}" 2>/dev/null | head -1 || true)"
+            if [ -z "${file}" ] || [ ! -f "${file}" ]; then
+              echo "::error::No GUI artifact found for target ${{ matrix.target }}"
+              exit 1
+            fi
+            cp "${file}" "dist/${base}.${ext}"
+          fi
+
+      - name: Upload GUI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-${{ matrix.target }}
+          path: dist/*
+
+  # ============================================================
+  # GUI Android APK builds
+  # ============================================================
+  build-gui-android:
+    needs: [resolve-matrix, build-frontend]
+    if: needs.resolve-matrix.outputs.has_gui_android == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve-matrix.outputs.gui_android) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout project repo
+        uses: actions/checkout@v4
+
+      - name: Checkout workspace
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SRC_URL || vars.SRC_URL }}
+          ref: ${{ needs.resolve-matrix.outputs.workspace_ref }}
+          token: ${{ secrets.GHTOKEN }}
+          path: workspace
+          submodules: true
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: workspace/frontend/dist
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install system dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential pkg-config clang cmake ninja-build
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK/NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build-tools
+        shell: bash
+        run: |
+          sdkmanager "build-tools;34.0.0"
+          set +o pipefail
+          yes | sdkmanager --licenses > /dev/null
+          set -o pipefail
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: workspace
+          key: gui-android-${{ matrix.target }}
+
+      - name: Install cargo-tauri CLI
+        uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli@2
+
+      - name: Generate GUI mobile icons
+        working-directory: workspace/src-tauri
+        shell: bash
+        run: cargo tauri icon "icons/icon.png" -o "icons"
+
+      - name: Sync GUI version (Android)
+        working-directory: workspace/src-tauri
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          version = "${{ needs.resolve-matrix.outputs.pkg_version }}"
+          run_number_raw = os.environ.get("GITHUB_RUN_NUMBER", "")
+          if not run_number_raw.isdigit():
+              raise SystemExit(f"Missing/invalid GITHUB_RUN_NUMBER: {run_number_raw!r}")
+          run_number = int(run_number_raw)
+          base = 1_000_000_000
+          version_code = base + run_number
+          if version_code > 2_100_000_000:
+              raise SystemExit(f"Android versionCode overflow: {version_code}")
+
+          p = Path("tauri.conf.json")
+          cfg = json.loads(p.read_text(encoding="utf-8"))
+          cfg["version"] = version
+          cfg.setdefault("bundle", {}).setdefault("android", {})["versionCode"] = version_code
+          # CI 中 frontend dist 已由 build-frontend job 提供，置空 beforeBuildCommand 避免重复构建
+          cfg.setdefault("build", {})["beforeBuildCommand"] = ""
+          p.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+
+          android_p = Path("tauri.android.conf.json")
+          if android_p.exists():
+              android_cfg = json.loads(android_p.read_text(encoding="utf-8"))
+              android_cfg["version"] = version
+              android_cfg.setdefault("bundle", {}).setdefault("android", {})["versionCode"] = version_code
+              android_cfg.setdefault("build", {})["beforeBuildCommand"] = ""
+              android_p.write_text(json.dumps(android_cfg, indent=2) + "\n", encoding="utf-8")
+
+          github_env = os.environ.get("GITHUB_ENV")
+          if github_env:
+              with open(github_env, "a", encoding="utf-8") as fh:
+                  fh.write(f"BAOMIHUA_GUI_ANDROID_VERSION={version}\n")
+                  fh.write(f"BAOMIHUA_GUI_ANDROID_VERSION_CODE={version_code}\n")
+          PY
+
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Set NDK cross-compilation environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          ndk_root="$(ls -d "${sdk_root}"/ndk/* 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -z "${ndk_root}" ]; then
+            echo "::error::Android NDK not found under ${sdk_root}"
+            exit 1
+          fi
+          # NDK 的宿主工具链目录按操作系统区分（macos 上为 darwin-x86_64，经 Rosetta 运行）
+          case "$(uname -s)" in
+            Darwin) ndk_host="darwin-x86_64" ;;
+            *)      ndk_host="linux-x86_64" ;;
+          esac
+          ndk_clang_base="${ndk_root}/toolchains/llvm/prebuilt/${ndk_host}/bin"
+          declare -A TARGET_TO_CLANG=(
+            [aarch64-linux-android]=aarch64-linux-android24
+            [armv7-linux-androideabi]=armv7a-linux-androideabi24
+            [x86_64-linux-android]=x86_64-linux-android24
+            [i686-linux-android]=i686-linux-android24
+          )
+          for target in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android; do
+            local_suffix="${TARGET_TO_CLANG[$target]}"
+            clang="${ndk_clang_base}/${local_suffix}-clang"
+            clangxx="${ndk_clang_base}/${local_suffix}-clang++"
+            ar="${ndk_clang_base}/llvm-ar"
+            upper="$(echo "$target" | tr '[:lower:]-' '[:upper:]_')"
+            underscore="$(echo "$target" | tr '-' '_')"
+            echo "CC_${underscore}=${clang}" >> "$GITHUB_ENV"
+            echo "CXX_${underscore}=${clangxx}" >> "$GITHUB_ENV"
+            echo "AR_${underscore}=${ar}" >> "$GITHUB_ENV"
+            echo "CARGO_TARGET_${upper}_LINKER=${clang}" >> "$GITHUB_ENV"
+            echo "BINDGEN_EXTRA_CLANG_ARGS_${upper}=--target=${local_suffix}" >> "$GITHUB_ENV"
+          done
+          echo "CLANG_PATH=${ndk_clang_base}/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          # NDK bin 目录没有通用 clang 可执行文件，bindgen/clang-sys 按 PATH 查找 clang 时
+          # 会命中宿主 clang；创建通用符号链接指向 target 专用 clang，并前置 PATH
+          ln -sf "${ndk_clang_base}/aarch64-linux-android24-clang" "${ndk_clang_base}/clang"
+          ln -sf "${ndk_clang_base}/aarch64-linux-android24-clang++" "${ndk_clang_base}/clang++"
+          echo "PATH=${ndk_clang_base}:${PATH}" >> "$GITHUB_ENV"
+
+      - name: Build Android lib
+        working-directory: workspace/src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 绕过 tauri CLI（其 cargo 调用触发 GitHub runner SIGTERM）：
+          # 1) cargo ndk 直接编译 lib；2) 复制 .so 到 jniLibs；3) gradle 打包（已移除 rust 插件）
+          case "${{ matrix.target }}" in
+            aarch64-linux-android) abi="arm64-v8a"; triple="aarch64-linux-android" ;;
+            armv7-linux-androideabi) abi="armeabi-v7a"; triple="armv7-linux-androideabi" ;;
+            x86_64-linux-android) abi="x86_64"; triple="x86_64-linux-android" ;;
+          esac
+          CARGO_NDK_PLATFORM=24 cargo ndk -t "${abi}" build --release --package baomihua-eu-org --lib
+          mkdir -p "gen/android/app/src/main/jniLibs/${abi}"
+          # cargo 的 workspace target 目录在 workspace 根（../target 相对 src-tauri）
+          lib_so="$(find "../target/${triple}/release" -maxdepth 1 -name 'libbaomihua_eu_org*.so' 2>/dev/null | head -1 || true)"
+          if [ -z "${lib_so}" ]; then
+            echo "::error::tauri lib not found for ${triple}"
+            ls -la "../target/${triple}/release/" 2>/dev/null | head -10 || true
+            exit 1
+          fi
+          cp "${lib_so}" "gen/android/app/src/main/jniLibs/${abi}/"
+          cd gen/android
+      - name: Recreate Android project (deterministic)
+        working-directory: workspace/src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf gen/android
+          cargo tauri android init --ci
+
+      - name: Patch Android project assets
+        working-directory: workspace/src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          import shutil
+          from pathlib import Path
+
+          version = os.environ["BAOMIHUA_GUI_ANDROID_VERSION"]
+          version_code = os.environ["BAOMIHUA_GUI_ANDROID_VERSION_CODE"]
+          root = Path(".")
+          icon_source = root / "icons" / "android"
+          res_target = root / "gen" / "android" / "app" / "src" / "main" / "res"
+
+          if icon_source.is_dir() and res_target.is_dir():
+              for entry in icon_source.iterdir():
+                  target = res_target / entry.name
+                  if entry.is_dir():
+                      target.mkdir(parents=True, exist_ok=True)
+                      for source in entry.iterdir():
+                          shutil.copy2(source, target / source.name)
+                  else:
+                      shutil.copy2(entry, target)
+
+          gradle_files = [
+              root / "gen" / "android" / "app" / "build.gradle.kts",
+              root / "gen" / "android" / "app" / "build.gradle",
+          ]
+          for gradle_file in gradle_files:
+              if not gradle_file.exists():
+                  continue
+              original = gradle_file.read_text(encoding="utf-8")
+              updated = re.sub(r'versionName\s*=\s*"[^"]*"', f'versionName = "{version}"', original)
+              updated = re.sub(r'versionName\s+"[^"]*"', f'versionName "{version}"', updated)
+              updated = re.sub(r'versionCode\s*=\s*\d+', f'versionCode = {version_code}', updated)
+              updated = re.sub(r'versionCode\s+\d+', f'versionCode {version_code}', updated)
+              # CI 预编译 .so（cargo ndk），移除 gradle 内 rust 编译：
+              # 其内部调用 cargo tauri android android-studio-script 会触发 GitHub runner SIGTERM
+              updated = re.sub(r'id\("rust"\)\s*\n', '', updated)
+              updated = re.sub(r'rust\s*\{[^}]*\}\s*\n?', '', updated)
+              if updated != original:
+                  gradle_file.write_text(updated, encoding="utf-8")
+
+          # 覆盖 MainActivity.kt（用户自定义：状态栏/导航条安全区处理）。
+          # generated/（WryActivity.kt 等）由 tauri CLI 在 build 阶段生成，CI 移除了 rust 插件后
+          # 无人生成，这里从模板整体复制（内容与 Cargo.lock 固定的 tauri 2.11.5 匹配）
+          templates_dir = root / ".." / ".." / ".github" / "templates" / "android"
+          main_activity_tpl = templates_dir / "MainActivity.kt"
+          if not main_activity_tpl.exists():
+              raise SystemExit("MainActivity.kt template not found")
+          main_activity_dst = root / "gen" / "android" / "app" / "src" / "main" / "java" / "baomihua" / "eu" / "org" / "MainActivity.kt"
+          main_activity_dst.write_text(
+              main_activity_tpl.read_text(encoding="utf-8").replace("{{android-identifier}}", "baomihua.eu.org"),
+              encoding="utf-8",
+          )
+          generated_tpl = templates_dir / "generated"
+          generated_dst = root / "gen" / "android" / "app" / "src" / "main" / "java" / "baomihua" / "eu" / "org" / "generated"
+          generated_dst.mkdir(parents=True, exist_ok=True)
+          for tpl in sorted(generated_tpl.glob("*")):
+              content = tpl.read_text(encoding="utf-8")
+              content = content.replace("{{android-identifier}}", "baomihua.eu.org")
+              (generated_dst / tpl.name).write_text(content, encoding="utf-8")
+          PY
+
+      - name: Build Android APK
+        working-directory: workspace/src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          # tauri CLI 在 CI 环境可能生成不完整（init 早于 cargo 下载 tauri）；缺失时补全
+          if [ ! -f "gen/android/tauri.settings.gradle" ]; then
+            tauri_mobile="$(find "${HOME}/.cargo/registry/src" -maxdepth 5 -type d -path '*/tauri-*/mobile/android' 2>/dev/null | head -1 || true)"
+            if [ -z "${tauri_mobile}" ]; then
+              echo "::error::tauri mobile/android module not found in cargo registry"
+              exit 1
+            fi
+            printf "include ':tauri-android'\nproject(':tauri-android').projectDir = new File(\"%s\")\n" "${tauri_mobile}" > "gen/android/tauri.settings.gradle"
+          fi
+          if [ ! -f "gen/android/app/tauri.build.gradle.kts" ]; then
+            printf 'val implementation by configurations\ndependencies {\n  implementation("androidx.lifecycle:lifecycle-process:2.10.0")\n  implementation(project(":tauri-android"))\n}\n' > "gen/android/app/tauri.build.gradle.kts"
+          fi
+          cd gen/android
+          ./gradlew assembleRelease --no-daemon
+      - name: Sign Android APK
+        working-directory: workspace/src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          ks_dir="${{ github.workspace }}/workspace/script/android"
+          ks_file="${ks_dir}/android-release.keystore"
+          props_file="${ks_dir}/keystore.properties"
+
+          if [ ! -f "${ks_file}" ] || [ ! -f "${props_file}" ]; then
+            echo "::error::Android signing keystore missing: ${ks_file} / ${props_file}"
+            exit 1
+          fi
+
+          key_alias="$(sed -n 's/^keyAlias=//p' "${props_file}" | head -1)"
+          store_password="$(sed -n 's/^storePassword=//p' "${props_file}" | head -1)"
+          key_password="$(sed -n 's/^keyPassword=//p' "${props_file}" | head -1)"
+          [ -n "${key_alias}" ] || { echo "::error::keyAlias missing in ${props_file}"; exit 1; }
+          [ -n "${store_password}" ] || { echo "::error::storePassword missing in ${props_file}"; exit 1; }
+          [ -n "${key_password}" ] || { echo "::error::keyPassword missing in ${props_file}"; exit 1; }
+
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          build_tools="${sdk_root}/build-tools/34.0.0"
+          zipalign="${build_tools}/zipalign"
+          apksigner="${build_tools}/apksigner"
+          [ -x "${zipalign}" ] || { echo "::error::zipalign not executable in ${build_tools}"; exit 1; }
+          [ -x "${apksigner}" ] || { echo "::error::apksigner not executable in ${build_tools}"; exit 1; }
+
+          apk="$(find gen/android -type f -name '*.apk' 2>/dev/null | grep -E '(release|unsigned)' | head -1 || true)"
+          if [ -z "${apk}" ]; then
+            apk="$(find gen/android -type f -name '*.apk' 2>/dev/null | head -1 || true)"
+          fi
+          if [ -z "${apk}" ] || [ ! -f "${apk}" ]; then
+            echo "::error::No APK found for signing"
+            exit 1
+          fi
+
+          aligned="${RUNNER_TEMP}/baomihua-aligned.apk"
+          signed="${RUNNER_TEMP}/baomihua-signed.apk"
+          "${zipalign}" -f -p 4 "${apk}" "${aligned}"
+          "${apksigner}" sign \
+            --ks "${ks_file}" \
+            --ks-key-alias "${key_alias}" \
+            --ks-pass "pass:${store_password}" \
+            --key-pass "pass:${key_password}" \
+            --out "${signed}" \
+            "${aligned}"
+          "${apksigner}" verify --verbose "${signed}"
+          echo "SIGNED_APK=${signed}" >> "$GITHUB_ENV"
+
+      - name: Package Android artifact
+        working-directory: workspace/src-tauri
+        shell: bash
+        run: |
+          target="${{ matrix.target }}"
+          source "${{ github.workspace }}/.github/scripts/arch-helpers.sh"
+          base="$(baomihua_gui_base "${target}" android)"
+
+          apk="${SIGNED_APK:-}"
+          if [ -z "${apk}" ] || [ ! -f "${apk}" ]; then
+            apk="$(find gen/android -type f -name '*.apk' 2>/dev/null | head -1 || true)"
+          fi
+          if [ -z "${apk}" ] || [ ! -f "${apk}" ]; then
+            echo "::error::No APK artifact found for target ${target}"
+            exit 1
+          fi
+
+          mkdir -p dist
+          cp "${apk}" "dist/${base}.apk"
+
+      - name: Upload GUI Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-${{ matrix.target }}
+          path: workspace/src-tauri/dist/*
+
+  # ============================================================
+  # GUI iOS IPA builds (unsigned)
+  # ============================================================
+  build-gui-ios:
+    needs: [resolve-matrix, build-frontend]
+    if: needs.resolve-matrix.outputs.has_gui_ios == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve-matrix.outputs.gui_ios) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout project repo
+        uses: actions/checkout@v4
+
+      - name: Checkout workspace
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.SRC_URL || vars.SRC_URL }}
+          ref: ${{ needs.resolve-matrix.outputs.workspace_ref }}
+          token: ${{ secrets.GHTOKEN }}
+          path: workspace
+          submodules: true
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: workspace/frontend/dist
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: workspace
+          key: gui-ios-${{ matrix.target }}
+
+      - name: Install cargo-tauri CLI
+        shell: bash
+        run: cargo install tauri-cli --locked --force --version '^2'
+
+      - name: Install iOS project dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          arch -arm64 brew install xcodegen cocoapods
+
+      - name: Generate GUI mobile icons
+        working-directory: workspace/src-tauri
+        shell: bash
+        run: cargo tauri icon "icons/icon.png" -o "icons"
+
+      - name: Sync GUI version (iOS)
+        working-directory: workspace/src-tauri
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          version = "${{ needs.resolve-matrix.outputs.pkg_version }}"
+          run_number_raw = os.environ.get("GITHUB_RUN_NUMBER", "")
+          if not run_number_raw.isdigit():
+              raise SystemExit(f"Missing/invalid GITHUB_RUN_NUMBER: {run_number_raw!r}")
+          run_number = int(run_number_raw)
+          base = 1_000_000_000
+          version_code = base + run_number
+          if version_code > 2_100_000_000:
+              raise SystemExit(f"iOS bundleVersion overflow: {version_code}")
+
+          p = Path("tauri.conf.json")
+          cfg = json.loads(p.read_text(encoding="utf-8"))
+          cfg["version"] = version
+          cfg.setdefault("bundle", {}).setdefault("iOS", {})["bundleVersion"] = str(version_code)
+          # CI 中 frontend dist 已由 build-frontend job 提供，置空 beforeBuildCommand 避免重复构建
+          cfg.setdefault("build", {})["beforeBuildCommand"] = ""
+          p.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+
+          ios_p = Path("tauri.ios.conf.json")
+          if ios_p.exists():
+              ios_cfg = json.loads(ios_p.read_text(encoding="utf-8"))
+              ios_cfg["version"] = version
+              ios_cfg.setdefault("bundle", {}).setdefault("iOS", {})["bundleVersion"] = str(version_code)
+              ios_cfg.setdefault("build", {})["beforeBuildCommand"] = ""
+              ios_p.write_text(json.dumps(ios_cfg, indent=2) + "\n", encoding="utf-8")
+
+          github_env = os.environ.get("GITHUB_ENV")
+          if github_env:
+              with open(github_env, "a", encoding="utf-8") as fh:
+                  fh.write(f"BAOMIHUA_GUI_IOS_VERSION={version}\n")
+                  fh.write(f"BAOMIHUA_GUI_IOS_BUNDLE_VERSION={version_code}\n")
+          PY
+
+      - name: Recreate iOS project (deterministic)
+        working-directory: workspace/src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf gen/apple
+          cargo tauri ios init --ci
+
+      - name: Patch iOS mobile project assets
+        working-directory: workspace/src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          import shutil
+          from pathlib import Path
+
+          version = os.environ["BAOMIHUA_GUI_IOS_VERSION"]
+          bundle_version = os.environ["BAOMIHUA_GUI_IOS_BUNDLE_VERSION"]
+          root = Path(".")
+          icon_source = root / "icons" / "ios"
+          apple_root = root / "gen" / "apple"
+
+          if icon_source.is_dir() and apple_root.is_dir():
+              for entry in apple_root.iterdir():
+                  if not entry.is_dir():
+                      continue
+                  app_icon = entry / "Assets.xcassets" / "AppIcon.appiconset"
+                  if app_icon.parent.is_dir():
+                      if app_icon.exists():
+                          shutil.rmtree(app_icon)
+                      app_icon.mkdir(parents=True, exist_ok=True)
+                      for source in icon_source.iterdir():
+                          target = app_icon / source.name
+                          if source.is_dir():
+                              shutil.copytree(source, target)
+                          else:
+                              shutil.copy2(source, target)
+
+          pbxproj = apple_root / "baomihua-eu-org.xcodeproj" / "project.pbxproj"
+          if pbxproj.is_file():
+              original = pbxproj.read_text(encoding="utf-8")
+              updated = re.sub(r"MARKETING_VERSION = [^;]*;", f"MARKETING_VERSION = {version};", original)
+              updated = re.sub(
+                  r"CURRENT_PROJECT_VERSION = [^;]*;",
+                  f"CURRENT_PROJECT_VERSION = {bundle_version};",
+                  updated,
+              )
+              if updated != original:
+                  pbxproj.write_text(updated, encoding="utf-8")
+          PY
+
+      - name: Build iOS IPA (unsigned)
+        working-directory: workspace/src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcode_dev_dir="$(xcode-select -p)"
+          default_toolchain="${xcode_dev_dir}/Toolchains/XcodeDefault.xctoolchain"
+          ci_xcconfig="/tmp/baomihua-ios-ci.xcconfig"
+          swift_lib_paths="${default_toolchain}/usr/lib/swift/iphoneos ${default_toolchain}/usr/lib/swift-5.0/iphoneos"
+          swift_ldflags="-L${default_toolchain}/usr/lib/swift/iphoneos -L${default_toolchain}/usr/lib/swift-5.0/iphoneos"
+          cat > "${ci_xcconfig}" <<'XCCONFIG'
+          TOOLCHAINS = com.apple.dt.toolchain.XcodeDefault
+          XCCONFIG
+
+          tauri_target="${{ matrix.target }}"
+          case "${{ matrix.target }}" in
+            aarch64-apple-ios) tauri_target="aarch64" ;;
+          esac
+
+          set +e
+          if cargo tauri ios build --help | grep -q -- '--no-sign'; then
+            APPLE_CERTIFICATE="" \
+            APPLE_CERTIFICATE_PASSWORD="" \
+            APPLE_SIGNING_IDENTITY="" \
+            APPLE_TEAM_ID="" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            PROVISIONING_PROFILE="" \
+            XCODE_XCCONFIG_FILE="${ci_xcconfig}" \
+            LIBRARY_SEARCH_PATHS="${swift_lib_paths}" \
+            OTHER_LDFLAGS="${swift_ldflags}" \
+            TOOLCHAINS="com.apple.dt.toolchain.XcodeDefault" \
+            TOOLCHAIN_DIR="${default_toolchain}" \
+            cargo tauri ios build --ci --target "${tauri_target}" --no-sign 2>&1 | tee /tmp/xcodebuild-ios.log
+          else
+            APPLE_CERTIFICATE="" \
+            APPLE_CERTIFICATE_PASSWORD="" \
+            APPLE_SIGNING_IDENTITY="" \
+            APPLE_TEAM_ID="" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            PROVISIONING_PROFILE="" \
+            XCODE_XCCONFIG_FILE="${ci_xcconfig}" \
+            LIBRARY_SEARCH_PATHS="${swift_lib_paths}" \
+            OTHER_LDFLAGS="${swift_ldflags}" \
+            TOOLCHAINS="com.apple.dt.toolchain.XcodeDefault" \
+            TOOLCHAIN_DIR="${default_toolchain}" \
+            cargo tauri ios build --ci --target "${tauri_target}" 2>&1 | tee /tmp/xcodebuild-ios.log
+          fi
+          build_exit="${PIPESTATUS[0]}"
+          set -e
+
+          if [ "${build_exit}" -ne 0 ]; then
+            if grep -Eq 'exportArchive No Team Found in Archive|failed to export iOS app|EXPORT FAILED' /tmp/xcodebuild-ios.log; then
+              echo "::warning::Ignoring export failure for unsigned build; packaging .app manually."
+            elif grep -Eq 'failed to open file .*\.app' /tmp/xcodebuild-ios.log; then
+              # tauri-cli 用 stylized_name().with_extension("app") 定位产物，
+              # productName 带点（BaoMiHua.EU.org）时 .org 被当作扩展名剥离，
+              # 导致找不到 xcarchive 里的 .app；xcarchive 已生成，由 Package iOS artifact 手动打包
+              echo "::warning::tauri-cli app path mismatch for dotted productName; packaging .app manually."
+            else
+              exit "${build_exit}"
+            fi
+          fi
+
+      - name: Package iOS artifact
+        working-directory: workspace/src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "${{ github.workspace }}/.github/scripts/arch-helpers.sh"
+          base="$(baomihua_gui_base "${{ matrix.target }}" ios-app)"
+
+          # iOS 产物约定：不签名、不真正封包，仅将编译出的 .app 目录打包为 zip 后重命名为 .ipa。
+          # 需要真机安装的人自行解压、签名并重新封包。
+          app="$(find gen/apple/build/Build/Products -type d -name '*.app' 2>/dev/null | head -1 || true)"
+          if [ -z "${app}" ] || [ ! -d "${app}" ]; then
+            app="$(find gen/apple/build -type d -name '*.app' 2>/dev/null | head -1 || true)"
+          fi
+          if [ -z "${app}" ] || [ ! -d "${app}" ]; then
+            echo "::error::No .app bundle found for target ${{ matrix.target }}"
+            exit 1
+          fi
+
+          rm -rf /tmp/ios-payload
+          mkdir -p /tmp/ios-payload/Payload
+          cp -R "${app}" /tmp/ios-payload/Payload/
+          (cd /tmp/ios-payload && zip -r -q "${base}.ipa" Payload)
+
+          mkdir -p dist
+          cp "/tmp/ios-payload/${base}.ipa" "dist/${base}.ipa"
+
+      - name: Upload GUI iOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-${{ matrix.target }}
+          path: workspace/src-tauri/dist/*
+
+  # ============================================================
+  # Linux packaging via nFPM (deb/rpm/apk/archlinux)
+  # ============================================================
+  publish:
+    needs:
+      [
+        resolve-matrix,
+        build-cli,
+        build-cli-cross,
+        build-cli-android,
+        build-gui,
+        build-gui-android,
+        build-gui-ios,
+      ]
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "{cli-*,gui-*,packages-*}"
+          path: /tmp/release
+          merge-multiple: true
+
+      - name: Generate release notes
+        env:
+          RELEASE_TAG: ${{ needs.resolve-matrix.outputs.release_tag }}
+          PKG_VERSION: ${{ needs.resolve-matrix.outputs.pkg_version }}
+          PRERELEASE: ${{ github.event.inputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          notes_file="/tmp/release-notes.md"
+          channel="stable"
+          if [ "${PRERELEASE}" = "true" ]; then
+            channel="prerelease"
+          fi
+          {
+            echo "## BaoMiHua ${PKG_VERSION}"
+            echo
+            echo "- Release tag: \`${RELEASE_TAG}\`"
+            echo "- Channel: ${channel}"
+            echo
+            echo "Download matching installers from the release assets below or visit the download page on baomihua.eu.org."
+          } > "${notes_file}"
+
+      - name: Keep only standardized release filenames
+        run: |
+          find /tmp/release -type f | while read -r f; do
+            bn="$(basename "$f")"
+            if [[ "$bn" != bmh-* ]]; then
+              rm -f "$f"
+            fi
+          done
+
+      - name: List release files
+        run: |
+          echo "=== Release artifacts ==="
+          find /tmp/release -type f | sort
+          count="$(find /tmp/release -type f | wc -l)"
+          echo "Total: ${count} files"
+          if [ "${count}" -eq 0 ]; then
+            echo "::error::No release artifacts found"
+            exit 1
+          fi
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve-matrix.outputs.release_tag }}
+          name: ${{ needs.resolve-matrix.outputs.release_tag }}
+          prerelease: ${{ github.event.inputs.prerelease == 'true' }}
+          generate_release_notes: false
+          fail_on_unmatched_files: false
+          files: /tmp/release/*
+          body_path: /tmp/release-notes.md
